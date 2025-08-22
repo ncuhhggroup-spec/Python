@@ -1,7 +1,7 @@
 """
 RandomValue IOC with Start/Stop and a simple Tkinter UI.
 
-Requires:
+Requirements:
   - pythonSoftIOC (pip install pythonSoftIOC)
   - tkinter (standard library on most Python installs)
 
@@ -12,32 +12,46 @@ This publishes:
 UI:
   - Start/Stop buttons toggle 'Enable'
   - Displays PV name, current value, and enabled state
+
+Change in this revision:
+  - FIX for Windows AssertionError: we DO NOT call loop.run_forever() ourselves.
+    AsyncioDispatcher runs its own loop thread, so we create the IOC on the main
+    thread and just run Tk's mainloop. This avoids the background-thread
+    run_forever() assertion on Windows.
+  - Pressing Start updates the value immediately and then every 1 second.
+  - Clean shutdown on window close.
 """
 
-import threading
 import random
-import time
 import tkinter as tk
 from tkinter import ttk
+import asyncio
 
 from softioc import softioc, builder, asyncio_dispatcher
-import asyncio
 
 
 # ---------------------- IOC Layer (OOP) ----------------------
 class RandomValueIOC:
+    """OOP wrapper around pythonSoftIOC that publishes a random value.
+
+    Public API:
+      - set_on_value_callback(cb: Callable[[float, bool], None])
+      - start()  -> enable periodic updates
+      - stop()   -> disable periodic updates
+    """
+
     def __init__(self, prefix: str = "Station_Laser:TestDevice", period_s: float = 1.0):
         self.prefix = prefix
-        self.period = period_s
+        self.period = float(period_s)
         self._enabled = False
-        self._task = None
+        self._task: asyncio.Task | None = None
         self._on_value_callback = None  # UI hook
 
-        # Create dispatcher (asyncio loop in this process)
+        # Create dispatcher (runs an asyncio loop in its OWN background thread)
         self.dispatcher = asyncio_dispatcher.AsyncioDispatcher()
         self.loop: asyncio.AbstractEventLoop = self.dispatcher.loop
 
-        # Build database
+        # Build EPICS database
         builder.SetDeviceName(self.prefix)
 
         # Readback value (ai)
@@ -50,8 +64,7 @@ class RandomValueIOC:
             initial_value=0.0,
         )
 
-        # Enable control (bo). If your pythonSoftIOC lacks boolOut,
-        # comment the boolOut lines and use the longOut/longIn alternative below.
+        # Enable control (bo) with fallback to longIn/longOut if needed
         try:
             self.enable_bo = builder.boolOut(
                 "Enable",
@@ -62,7 +75,7 @@ class RandomValueIOC:
             )
             self._use_bool = True
         except Exception:
-            # Fallback: use integer 0/1 via longin/longout
+            # Fallback: integer 0/1 via longin/longout
             self.enable_li = builder.longIn("Enable_RBV", initial_value=0)
             self.enable_lo = builder.longOut(
                 "Enable",
@@ -73,7 +86,7 @@ class RandomValueIOC:
 
         builder.LoadDatabase()
 
-        # Initialize IOC — NOTE: this must run in the same thread that owns the loop
+        # Initialize IOC — the dispatcher's loop thread is already running
         softioc.iocInit(self.dispatcher)
 
     # ---------- Public API ----------
@@ -82,7 +95,7 @@ class RandomValueIOC:
         self._on_value_callback = cb
 
     def start(self):
-        """Enable updates (can be called from any thread)."""
+        """Enable updates (thread-safe)."""
         if self._use_bool:
             self.enable_bo.set(True)
         else:
@@ -91,7 +104,7 @@ class RandomValueIOC:
         self._set_enabled(True)
 
     def stop(self):
-        """Disable updates (can be called from any thread)."""
+        """Disable updates (thread-safe)."""
         if self._use_bool:
             self.enable_bo.set(False)
         else:
@@ -105,7 +118,7 @@ class RandomValueIOC:
         self._set_enabled(bool(value))
 
     def _set_enabled(self, enable: bool):
-        # This may be called from UI thread. Marshal into asyncio loop.
+        # Marshal into asyncio loop thread if needed
         def _apply():
             if enable and not self._enabled:
                 self._enabled = True
@@ -116,21 +129,22 @@ class RandomValueIOC:
                 if self._task and not self._task.done():
                     self._task.cancel()
 
-        # Ensure we modify state in the asyncio loop thread
-        if asyncio.get_event_loop() is self.loop:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self.loop:
             _apply()
         else:
             self.loop.call_soon_threadsafe(_apply)
 
     async def _run_updates(self):
+        """Immediately push a random value, then update every `period`."""
         try:
             while self._enabled:
                 val = random.random()
-                # Update PV
                 self.random_ai.set(val)
-                # Notify UI (if registered)
                 if self._on_value_callback:
-                    # Call UI callback in a safe way (we only schedule; UI will marshal to its thread)
                     self._on_value_callback(val, self._enabled)
                 await asyncio.sleep(self.period)
         except asyncio.CancelledError:
@@ -142,7 +156,7 @@ class RandomValueUI(tk.Tk):
     def __init__(self, ioc: RandomValueIOC):
         super().__init__()
         self.title("EPICS RandomValue IOC")
-        self.geometry("420x180")
+        self.geometry("440x190")
         self.resizable(False, False)
 
         self.ioc = ioc
@@ -159,7 +173,7 @@ class RandomValueUI(tk.Tk):
         frm.pack(fill="both", expand=True, **pad)
 
         ttk.Label(frm, text="PV Name:").grid(row=0, column=0, sticky="e")
-        ttk.Entry(frm, textvariable=self.pv_name_var, width=40, state="readonly").grid(row=0, column=1, sticky="w")
+        ttk.Entry(frm, textvariable=self.pv_name_var, width=42, state="readonly").grid(row=0, column=1, sticky="w")
 
         ttk.Label(frm, text="Current Value:").grid(row=1, column=0, sticky="e")
         self.value_label = ttk.Label(frm, textvariable=self.value_var, font=("Segoe UI", 12, "bold"))
@@ -180,8 +194,8 @@ class RandomValueUI(tk.Tk):
         # Hook IOC callbacks
         self.ioc.set_on_value_callback(self.on_new_value_from_ioc)
 
-        # Periodic UI poll to refresh enabled state (in case external clients toggle it)
-        self.after(250, self.poll_enabled_state)
+        # Safe close
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ----- Button handlers -----
     def on_start(self):
@@ -201,43 +215,24 @@ class RandomValueUI(tk.Tk):
         self.value_var.set(f"{value:0.3f}")
         self.state_var.set("Enabled" if enabled else "Disabled")
 
-    # ----- Periodic poll (optional) -----
-    def poll_enabled_state(self):
-        # If you added a readback for enable, you could reflect it here.
-        # For now, we rely on callbacks + button handlers.
-        self.after(250, self.poll_enabled_state)
+    def on_close(self):
+        # Gracefully stop on window close
+        self.on_stop()
+        self.destroy()
 
 
 # ---------------------- Wiring & Run ----------------------
+
 def run_ioc_and_ui():
-    # Create IOC in a background thread (so Tk mainloop can own the main thread)
-    ioc_ready = threading.Event()
-    ioc_holder = {}
-
-    def ioc_thread():
-        ioc = RandomValueIOC(prefix="Station_Laser:TestDevice", period_s=1.0)
-        ioc_holder["ioc"] = ioc
-        ioc_ready.set()
-        # Keep the asyncio loop alive forever in this thread
-        # The IOC remains active while the process runs.
-        try:
-            ioc.loop.run_forever()
-        except KeyboardInterrupt:
-            pass
-
-    t = threading.Thread(target=ioc_thread, daemon=True)
-    t.start()
-
-    # Wait for IOC to be initialized
-    ioc_ready.wait()
-    ioc = ioc_holder["ioc"]
-
-    # Launch UI on main thread
+    """Create IOC (whose loop runs in background) and start Tk UI on main thread."""
+    ioc = RandomValueIOC(prefix="Station_Laser:TestDevice", period_s=1.0)
     ui = RandomValueUI(ioc)
-    ui.mainloop()
+    try:
+        ui.mainloop()
+    finally:
+        # Ensure IOC stops tasks
+        ioc.stop()
 
-    # When UI closes, stop IOC loop gracefully
-    ioc.loop.call_soon_threadsafe(ioc.loop.stop)
 
 if __name__ == "__main__":
     run_ioc_and_ui()
